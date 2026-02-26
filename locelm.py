@@ -1,5 +1,5 @@
 """
-locELM: Local Extreme Learning Machines for solving 1D linear PDEs.
+locELM: Local Extreme Learning Machines for solving 1D/2D linear PDEs.
 
 Reproduces: S. Dong & Z. Li, "Local Extreme Learning Machines and Domain
 Decomposition for Solving Linear and Nonlinear PDEs", CMAME 2021.
@@ -189,5 +189,284 @@ def evaluate_solution(x_eval, beta, subdomains, M):
         beta_s = beta[s * M : (s + 1) * M]
         u_s = V @ beta_s
         u_eval = u_eval + u_s * mask
+
+    return u_eval
+
+
+# ===== 2D functions =====
+
+
+def init_params_2d(key, M, R_m):
+    """Initialize random hidden-layer weights and biases for one 2D local ELM."""
+    k1, k2 = jax.random.split(key)
+    W = jax.random.uniform(k1, (M, 2), minval=-R_m, maxval=R_m)
+    b = jax.random.uniform(k2, (M,), minval=-R_m, maxval=R_m)
+    return W, b
+
+
+def compute_basis_2d(xy_points, W, b, x_lo, x_hi, y_lo, y_hi):
+    """Compute V, dV/dx, dV/dy, d²V/dx², d²V/dy² at 2D collocation points.
+
+    Args:
+        xy_points: (Q, 2) collocation points
+        W: (M, 2) hidden layer weights
+        b: (M,) biases
+        x_lo, x_hi, y_lo, y_hi: subdomain bounds
+
+    Returns:
+        V, dV_dx, dV_dy, d2V_dx2, d2V_dy2: each (Q, M)
+    """
+    scale_x = 2.0 / (x_hi - x_lo)
+    scale_y = 2.0 / (y_hi - y_lo)
+    x_norm = 2.0 * (xy_points[:, 0] - x_lo) / (x_hi - x_lo) - 1.0
+    y_norm = 2.0 * (xy_points[:, 1] - y_lo) / (y_hi - y_lo) - 1.0
+
+    z = x_norm[:, None] * W[None, :, 0] + y_norm[:, None] * W[None, :, 1] + b[None, :]
+    V = jnp.tanh(z)
+    sech2 = 1.0 - V**2
+    wx = W[None, :, 0] * scale_x
+    wy = W[None, :, 1] * scale_y
+
+    dV_dx = sech2 * wx
+    dV_dy = sech2 * wy
+    d2V_dx2 = -2.0 * V * sech2 * wx**2
+    d2V_dy2 = -2.0 * V * sech2 * wy**2
+
+    return V, dV_dx, dV_dy, d2V_dx2, d2V_dy2
+
+
+def solve_locelm_2d(
+    pde_coeffs, source_fn, bc_fn, domain, Nx, Ny, Qx, Qy, M, R_m, seed=0
+):
+    """Solve a 2D linear PDE with Dirichlet BCs using locELM.
+
+    PDE: a_xx * d²u/dx² + a_yy * d²u/dy² + a_0 * u = f(x,y)
+    on [a1, b1] x [a2, b2] with u = bc_fn on boundary.
+
+    C^1 continuity is imposed on all internal subdomain boundaries.
+    """
+    a1, b1, a2, b2 = domain
+    a_xx, a_yy, a_0 = pde_coeffs
+
+    x_bounds = jnp.linspace(a1, b1, Nx + 1)
+    y_bounds = jnp.linspace(a2, b2, Ny + 1)
+
+    N_e = Nx * Ny
+    Qxy = Qx * Qy
+    total_unknowns = N_e * M
+
+    key = jax.random.PRNGKey(seed)
+    keys = jax.random.split(key, N_e)
+
+    subdomains = {}
+    for m in range(Nx):
+        for n in range(Ny):
+            e = m * Ny + n
+            x_lo = float(x_bounds[m])
+            x_hi = float(x_bounds[m + 1])
+            y_lo = float(y_bounds[n])
+            y_hi = float(y_bounds[n + 1])
+            W, b_vec = init_params_2d(keys[e], M, R_m)
+
+            xx, yy = jnp.meshgrid(
+                jnp.linspace(x_lo, x_hi, Qx),
+                jnp.linspace(y_lo, y_hi, Qy),
+                indexing="ij",
+            )
+            xy_pts = jnp.stack([xx.ravel(), yy.ravel()], axis=1)
+
+            V, dV_dx, dV_dy, d2V_dx2, d2V_dy2 = compute_basis_2d(
+                xy_pts, W, b_vec, x_lo, x_hi, y_lo, y_hi
+            )
+            LV = a_xx * d2V_dx2 + a_yy * d2V_dy2 + a_0 * V
+
+            subdomains[(m, n)] = {
+                "W": W,
+                "b": b_vec,
+                "x_lo": x_lo,
+                "x_hi": x_hi,
+                "y_lo": y_lo,
+                "y_hi": y_hi,
+                "xy_points": xy_pts,
+                "LV": LV,
+            }
+
+    total_rows = N_e * (Qxy + 2 * Qx + 2 * Qy)
+    A = jnp.zeros((total_rows, total_unknowns))
+    rhs = jnp.zeros(total_rows)
+    row = 0
+
+    def eidx(m, n):
+        return m * Ny + n
+
+    # --- PDE residual: N_e * Qxy rows ---
+    for m in range(Nx):
+        for n in range(Ny):
+            e = eidx(m, n)
+            sd = subdomains[(m, n)]
+            A = A.at[row : row + Qxy, e * M : (e + 1) * M].set(sd["LV"])
+            rhs = rhs.at[row : row + Qxy].set(jax.vmap(source_fn)(sd["xy_points"]))
+            row += Qxy
+
+    # --- Boundary conditions ---
+    def _add_bc(A, rhs, row, sd, e, xy_bc):
+        n_pts = xy_bc.shape[0]
+        V_bc = compute_basis_2d(
+            xy_bc, sd["W"], sd["b"], sd["x_lo"], sd["x_hi"], sd["y_lo"], sd["y_hi"]
+        )[0]
+        A = A.at[row : row + n_pts, e * M : (e + 1) * M].set(V_bc)
+        rhs = rhs.at[row : row + n_pts].set(jax.vmap(bc_fn)(xy_bc))
+        return A, rhs, row + n_pts
+
+    # Left x=a1
+    for n in range(Ny):
+        sd = subdomains[(0, n)]
+        y_pts = jnp.linspace(sd["y_lo"], sd["y_hi"], Qy)
+        xy_bc = jnp.stack([jnp.full(Qy, a1), y_pts], axis=1)
+        A, rhs, row = _add_bc(A, rhs, row, sd, eidx(0, n), xy_bc)
+
+    # Right x=b1
+    for n in range(Ny):
+        sd = subdomains[(Nx - 1, n)]
+        y_pts = jnp.linspace(sd["y_lo"], sd["y_hi"], Qy)
+        xy_bc = jnp.stack([jnp.full(Qy, b1), y_pts], axis=1)
+        A, rhs, row = _add_bc(A, rhs, row, sd, eidx(Nx - 1, n), xy_bc)
+
+    # Bottom y=a2
+    for m in range(Nx):
+        sd = subdomains[(m, 0)]
+        x_pts = jnp.linspace(sd["x_lo"], sd["x_hi"], Qx)
+        xy_bc = jnp.stack([x_pts, jnp.full(Qx, a2)], axis=1)
+        A, rhs, row = _add_bc(A, rhs, row, sd, eidx(m, 0), xy_bc)
+
+    # Top y=b2
+    for m in range(Nx):
+        sd = subdomains[(m, Ny - 1)]
+        x_pts = jnp.linspace(sd["x_lo"], sd["x_hi"], Qx)
+        xy_bc = jnp.stack([x_pts, jnp.full(Qx, b2)], axis=1)
+        A, rhs, row = _add_bc(A, rhs, row, sd, eidx(m, Ny - 1), xy_bc)
+
+    # --- C^1 continuity ---
+    # Vertical internal boundaries x = X_{m+1}
+    for m in range(Nx - 1):
+        xb = float(x_bounds[m + 1])
+        for n in range(Ny):
+            sd_l = subdomains[(m, n)]
+            sd_r = subdomains[(m + 1, n)]
+            e_l, e_r = eidx(m, n), eidx(m + 1, n)
+
+            y_pts = jnp.linspace(sd_l["y_lo"], sd_l["y_hi"], Qy)
+            xy_bnd = jnp.stack([jnp.full(Qy, xb), y_pts], axis=1)
+
+            V_l, dVx_l, *_ = compute_basis_2d(
+                xy_bnd,
+                sd_l["W"],
+                sd_l["b"],
+                sd_l["x_lo"],
+                sd_l["x_hi"],
+                sd_l["y_lo"],
+                sd_l["y_hi"],
+            )
+            V_r, dVx_r, *_ = compute_basis_2d(
+                xy_bnd,
+                sd_r["W"],
+                sd_r["b"],
+                sd_r["x_lo"],
+                sd_r["x_hi"],
+                sd_r["y_lo"],
+                sd_r["y_hi"],
+            )
+
+            # C^0
+            A = A.at[row : row + Qy, e_l * M : (e_l + 1) * M].set(V_l)
+            A = A.at[row : row + Qy, e_r * M : (e_r + 1) * M].set(-V_r)
+            row += Qy
+
+            # C^1 (du/dx)
+            A = A.at[row : row + Qy, e_l * M : (e_l + 1) * M].set(dVx_l)
+            A = A.at[row : row + Qy, e_r * M : (e_r + 1) * M].set(-dVx_r)
+            row += Qy
+
+    # Horizontal internal boundaries y = Y_{n+1}
+    for n in range(Ny - 1):
+        yb = float(y_bounds[n + 1])
+        for m in range(Nx):
+            sd_b = subdomains[(m, n)]
+            sd_t = subdomains[(m, n + 1)]
+            e_b, e_t = eidx(m, n), eidx(m, n + 1)
+
+            x_pts = jnp.linspace(sd_b["x_lo"], sd_b["x_hi"], Qx)
+            xy_bnd = jnp.stack([x_pts, jnp.full(Qx, yb)], axis=1)
+
+            V_b, _, dVy_b, *_ = compute_basis_2d(
+                xy_bnd,
+                sd_b["W"],
+                sd_b["b"],
+                sd_b["x_lo"],
+                sd_b["x_hi"],
+                sd_b["y_lo"],
+                sd_b["y_hi"],
+            )
+            V_t, _, dVy_t, *_ = compute_basis_2d(
+                xy_bnd,
+                sd_t["W"],
+                sd_t["b"],
+                sd_t["x_lo"],
+                sd_t["x_hi"],
+                sd_t["y_lo"],
+                sd_t["y_hi"],
+            )
+
+            # C^0
+            A = A.at[row : row + Qx, e_b * M : (e_b + 1) * M].set(V_b)
+            A = A.at[row : row + Qx, e_t * M : (e_t + 1) * M].set(-V_t)
+            row += Qx
+
+            # C^1 (du/dy)
+            A = A.at[row : row + Qx, e_b * M : (e_b + 1) * M].set(dVy_b)
+            A = A.at[row : row + Qx, e_t * M : (e_t + 1) * M].set(-dVy_t)
+            row += Qx
+
+    beta, _, _, _ = scipy.linalg.lstsq(
+        np.array(A), np.array(rhs), lapack_driver="gelsd"
+    )
+    return jnp.array(beta), subdomains
+
+
+def evaluate_solution_2d(xy_eval, beta, subdomains, Nx, Ny, M):
+    """Evaluate the 2D locELM solution at arbitrary points."""
+    u_eval = jnp.zeros(xy_eval.shape[0])
+
+    for m in range(Nx):
+        for n in range(Ny):
+            sd = subdomains[(m, n)]
+            in_x = (xy_eval[:, 0] >= sd["x_lo"]) & (
+                xy_eval[:, 0] < sd["x_hi"]
+                if m < Nx - 1
+                else xy_eval[:, 0] <= sd["x_hi"]
+            )
+            in_y = (xy_eval[:, 1] >= sd["y_lo"]) & (
+                xy_eval[:, 1] < sd["y_hi"]
+                if n < Ny - 1
+                else xy_eval[:, 1] <= sd["y_hi"]
+            )
+            mask = in_x & in_y
+
+            x_norm = (
+                2.0 * (xy_eval[:, 0] - sd["x_lo"]) / (sd["x_hi"] - sd["x_lo"]) - 1.0
+            )
+            y_norm = (
+                2.0 * (xy_eval[:, 1] - sd["y_lo"]) / (sd["y_hi"] - sd["y_lo"]) - 1.0
+            )
+            z = (
+                x_norm[:, None] * sd["W"][None, :, 0]
+                + y_norm[:, None] * sd["W"][None, :, 1]
+                + sd["b"][None, :]
+            )
+            V = jnp.tanh(z)
+
+            e = m * Ny + n
+            u_s = V @ beta[e * M : (e + 1) * M]
+            u_eval = u_eval + u_s * mask
 
     return u_eval
