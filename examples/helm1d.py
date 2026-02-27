@@ -22,6 +22,7 @@ from locelm import solve_locelm_1d, evaluate_solution
 jax.config.update("jax_enable_x64", True)
 
 LAMBDA = 10.0
+DOMAIN = (0.0, 8.0)
 
 
 def exact_solution(x):
@@ -33,7 +34,6 @@ def exact_solution(x):
 
 
 def exact_solution_d2(x):
-    """Second derivative of exact solution, computed analytically."""
     a1 = 3 * jnp.pi
     phi1 = 3 * jnp.pi / 20
     a2 = 2 * jnp.pi
@@ -50,26 +50,23 @@ def source_fn(x):
 
 
 def run(N_e, Q, M, R_m=3.0, seed=0, n_eval=1000):
-    domain = (0.0, 8.0)
-    bc_left = float(exact_solution(jnp.array(domain[0])))
-    bc_right = float(exact_solution(jnp.array(domain[1])))
-
-    pde_coeffs = (1.0, 0.0, -LAMBDA)  # u'' - lambda*u = f
+    bc_left = float(exact_solution(jnp.array(DOMAIN[0])))
+    bc_right = float(exact_solution(jnp.array(DOMAIN[1])))
 
     beta, subdomains = solve_locelm_1d(
-        pde_coeffs,
-        source_fn,
-        bc_left,
-        bc_right,
-        domain,
-        N_e,
-        Q,
-        M,
-        R_m,
-        seed,
+        pde_coeffs=(1.0, 0.0, -LAMBDA),
+        source_fn=source_fn,
+        bc_left=bc_left,
+        bc_right=bc_right,
+        domain=DOMAIN,
+        N_e=N_e,
+        Q=Q,
+        M=M,
+        R_m=R_m,
+        seed=seed,
     )
 
-    x_eval = jnp.linspace(domain[0], domain[1], n_eval)
+    x_eval = jnp.linspace(DOMAIN[0], DOMAIN[1], n_eval)
     u_num = evaluate_solution(x_eval, beta, subdomains, M)
     u_exact = jax.vmap(exact_solution)(x_eval)
 
