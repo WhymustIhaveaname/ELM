@@ -21,6 +21,7 @@ from locelm import evaluate_solution_2d, solve_locelm_2d
 jax.config.update("jax_enable_x64", True)
 
 LAMBDA = 10.0
+DOMAIN = (0.0, 3.6, 0.0, 3.6)
 
 
 def _phi_x(x):
@@ -31,7 +32,6 @@ def _phi_x(x):
 
 
 def _phi_xx(x):
-    """Second derivative of _phi_x."""
     return 1.5 * jnp.pi**2 * jnp.cos(jnp.pi * x + 2 * jnp.pi / 5) + 2.0 * (
         2 * jnp.pi
     ) ** 2 * jnp.cos(2 * jnp.pi * x - jnp.pi / 5)
@@ -48,27 +48,24 @@ def source_fn(xy):
     return laplacian - LAMBDA * _phi_x(x) * _phi_x(y)
 
 
-def run(Nx, Ny, Qx, Qy, M, R_m=1.5, seed=2, n_eval=50):
-    domain = (0.0, 3.6, 0.0, 3.6)
-    pde_coeffs = (1.0, 1.0, -LAMBDA)
-
+def run(Nx, Ny, Qx, Qy, M, R_m=1.5, seed=2, n_eval=200):
     beta, subdomains = solve_locelm_2d(
-        pde_coeffs,
-        source_fn,
-        exact_solution,
-        domain,
-        Nx,
-        Ny,
-        Qx,
-        Qy,
-        M,
-        R_m,
-        seed,
+        pde_coeffs=(1.0, 1.0, -LAMBDA),
+        source_fn=source_fn,
+        bc_fn=exact_solution,
+        domain=DOMAIN,
+        Nx=Nx,
+        Ny=Ny,
+        Qx=Qx,
+        Qy=Qy,
+        M=M,
+        R_m=R_m,
+        seed=seed,
     )
 
     xx, yy = jnp.meshgrid(
-        jnp.linspace(0.0, 3.6, n_eval),
-        jnp.linspace(0.0, 3.6, n_eval),
+        jnp.linspace(DOMAIN[0], DOMAIN[1], n_eval),
+        jnp.linspace(DOMAIN[2], DOMAIN[3], n_eval),
         indexing="ij",
     )
     xy_eval = jnp.stack([xx.ravel(), yy.ravel()], axis=1)

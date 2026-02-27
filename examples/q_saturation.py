@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Q-saturation study: fix NM=1024, vary Q to find the saturation point.
+Q-saturation study across multiple NM values.
 
-For each N in {1, 2, 4}:
-    M = 1024 // N
-    Q swept over Q_VALUES
+For each NM in {128, 256, 512, 1024} and each N in {1, 2, 4}:
+    M = NM // N
+    Q_total swept over Q_VALUES  (total collocation points across all subdomains)
+    Q_per_subdomain = Q_total // N
 
-The system transitions from underdetermined (Q < M) to overdetermined (Q > M)
-per subdomain. RMSE should plateau once Q is large enough.
-
-Output: log-log plot of RMSE vs Q with one line per N value.
+Output: 1x4 subplot figure, each panel for one NM value, three lines per panel.
 """
 
 import sys
@@ -22,45 +20,18 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from helm1d import DOMAIN, LAMBDA, exact_solution, source_fn
 from locelm import evaluate_solution, solve_locelm_1d
 
 jax.config.update("jax_enable_x64", True)
 
-# ---------- Problem: 1D Helmholtz  u'' - 10u = f  on [0, 8] ----------------
-LAMBDA = 10.0
-DOMAIN = (0.0, 8.0)
 R_M = 3.0
 SEED = 0
 N_EVAL = 1000
-NM = 1024   # fixed: N * M = 1024
 
 
-def exact_solution(x):
-    return (
-        jnp.sin(3 * jnp.pi * x + 3 * jnp.pi / 20)
-        * jnp.cos(2 * jnp.pi * x + jnp.pi / 10)
-        + 2.0
-    )
-
-
-def exact_solution_d2(x):
-    a1, phi1 = 3 * jnp.pi, 3 * jnp.pi / 20
-    a2, phi2 = 2 * jnp.pi, jnp.pi / 10
-    s1 = jnp.sin(a1 * x + phi1)
-    c1 = jnp.cos(a1 * x + phi1)
-    s2 = jnp.sin(a2 * x + phi2)
-    c2 = jnp.cos(a2 * x + phi2)
-    return -(a1**2 + a2**2) * s1 * c2 - 2 * a1 * a2 * c1 * s2
-
-
-def source_fn(x):
-    return exact_solution_d2(x) - LAMBDA * exact_solution(x)
-
-
-# ---------- Experiment runner -----------------------------------------------
-
-def run_experiment(N, M, Q):
-    """Run locELM for N subdomains, M basis functions, Q collocation pts/subdomain."""
+def run_experiment(NM, N, Q_total):
+    M = NM // N
     bc_left = float(exact_solution(jnp.array(DOMAIN[0])))
     bc_right = float(exact_solution(jnp.array(DOMAIN[1])))
 
@@ -71,7 +42,7 @@ def run_experiment(N, M, Q):
         bc_right=bc_right,
         domain=DOMAIN,
         N_e=N,
-        Q=Q,
+        Q=Q_total // N,
         M=M,
         R_m=R_M,
         seed=SEED,
@@ -84,74 +55,72 @@ def run_experiment(N, M, Q):
     return float(jnp.sqrt(jnp.mean((u_num - u_true) ** 2)))
 
 
-# ---------- Main ------------------------------------------------------------
-
 def main():
+    NM_VALUES = [128, 256, 512, 1024]
     N_VALUES = [1, 2, 4]
-    Q_VALUES = [25, 50, 100, 200, 400, 800, 1600, 3200, 6400]
+    Q_VALUES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+
+    all_results = {}
+
+    for NM in NM_VALUES:
+        print(f"\n===== NM={NM} =====")
+        print(f"{'N':>4}  {'M':>6}  {'Q_total':>8}  {'Q/sub':>6}  {'RMSE':>12}")
+        print("-" * 48)
+        for N in N_VALUES:
+            M = NM // N
+            pts = []
+            for Q in Q_VALUES:
+                rms = run_experiment(NM, N, Q)
+                pts.append((Q, rms))
+                print(f"{N:>4}  {M:>6}  {Q:>8}  {Q // N:>6}  {rms:>12.3e}")
+            all_results[(NM, N)] = pts
+            print()
 
     style = {
-        1: dict(color="C0", marker="o", label="N=1 (vanilla)"),
-        2: dict(color="C1", marker="s", label="N=2"),
-        4: dict(color="C2", marker="^", label="N=4 (paper)"),
+        1: dict(color="C0", marker="o"),
+        2: dict(color="C1", marker="s"),
+        4: dict(color="C2", marker="^"),
     }
 
-    print(f"NM={NM}, R_m={R_M}, domain={DOMAIN}, seed={SEED}")
-    print(f"\n{'N':>4}  {'M':>6}  {'Q':>6}  {'Q/M':>6}  {'RMSE':>12}")
-    print("-" * 44)
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4.5), sharey=True)
 
-    results = {}   # N -> list of (Q, rmse)
-    for N in N_VALUES:
-        M = NM // N
-        pts = []
-        for Q in Q_VALUES:
-            rms = run_experiment(N, M, Q)
-            pts.append((Q, rms))
-            ratio = Q / M
-            marker = "<" if Q < M else ("=" if Q == M else ">")
-            print(f"{N:>4}  {M:>6}  {Q:>6}  {ratio:>5.2f}{marker}  {rms:>12.3e}")
-        results[N] = pts
-        print()
+    for idx, NM in enumerate(NM_VALUES):
+        ax = axes[idx]
+        for N in N_VALUES:
+            M = NM // N
+            pts = all_results[(NM, N)]
+            Q_arr = np.array([q for q, _ in pts], dtype=float)
+            R_arr = np.array([r for _, r in pts], dtype=float)
 
-    # ---------- Plot -------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(7, 5))
+            st = style[N]
+            ax.loglog(
+                Q_arr,
+                R_arr,
+                marker=st["marker"],
+                color=st["color"],
+                linestyle="-",
+                linewidth=1.4,
+                markersize=6,
+                label=f"N={N} (M={M})",
+            )
 
-    for N in N_VALUES:
-        M = NM // N
-        Q_arr = np.array([q for q, _ in results[N]], dtype=float)
-        R_arr = np.array([r for _, r in results[N]], dtype=float)
+        ax.axvline(x=NM, color="gray", linestyle="--", linewidth=1.0, alpha=0.7)
+        ax.set_xlabel("$Q_{total}$", fontsize=11)
+        ax.set_title(f"NM = {NM}", fontsize=12)
+        ax.legend(fontsize=8, loc="best")
+        ax.grid(True, which="both", linestyle=":", alpha=0.4)
 
-        st = style[N]
-        ax.loglog(
-            Q_arr, R_arr,
-            marker=st["marker"], color=st["color"],
-            linestyle="-", linewidth=1.4, markersize=7,
-            label=f"{st['label']}  (M={M})",
-        )
-
-        # Vertical dashed line at Q = M (transition point)
-        ax.axvline(x=M, color=st["color"], linestyle=":", linewidth=0.8, alpha=0.6)
-
-    ax.set_xlabel("Q  (collocation points per subdomain)", fontsize=12)
-    ax.set_ylabel("RMSE", fontsize=12)
-    ax.set_title(
-        f"Q-saturation — 1D Helmholtz  (NM={NM}, $R_m$={R_M})",
-        fontsize=11,
-    )
-    ax.legend(fontsize=9, loc="best")
-    ax.grid(True, which="both", linestyle=":", alpha=0.5)
-
-    # Annotate transition lines
-    ax.text(
-        1024 * 1.05, ax.get_ylim()[0] * 10,
-        "Q=M\n(N=1)", fontsize=7, color="C0", alpha=0.7,
+    axes[0].set_ylabel("RMSE", fontsize=11)
+    fig.suptitle(
+        f"Q-saturation — 1D Helmholtz  ($R_m$={R_M}, seed={SEED})",
+        fontsize=13,
+        y=1.02,
     )
 
     plt.tight_layout()
     out_path = Path(__file__).parent / "q_saturation.png"
-    plt.savefig(out_path, dpi=150)
-    print(f"Figure saved → {out_path}")
-    plt.show()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\nFigure saved → {out_path}")
 
 
 if __name__ == "__main__":
