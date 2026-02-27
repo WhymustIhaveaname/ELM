@@ -193,6 +193,38 @@ def evaluate_solution(x_eval, beta, subdomains, M):
     return u_eval
 
 
+# ===== ND functions =====
+
+
+def init_params_nd(key, M, R_m, dim):
+    k1, k2 = jax.random.split(key)
+    W = jax.random.uniform(k1, (M, dim), minval=-R_m, maxval=R_m)
+    b = jax.random.uniform(k2, (M,), minval=-R_m, maxval=R_m)
+    return W, b
+
+
+def compute_basis_nd(points, W, b, lo, hi):
+    """Compute V and Laplacian(V) at collocation points in arbitrary dimension.
+
+    Args:
+        points: (Q, dim)
+        W: (M, dim), b: (M,)
+        lo, hi: (dim,) subdomain bounds
+
+    Returns:
+        V: (Q, M)
+        lap_V: (Q, M) — Σ_i d²V/dx_i²
+    """
+    scale = 2.0 / (hi - lo)
+    x_norm = 2.0 * (points - lo) / (hi - lo) - 1.0
+    z = x_norm @ W.T + b[None, :]
+    V = jnp.tanh(z)
+    sech2 = 1.0 - V**2
+    W_scaled_sq_sum = jnp.sum((W * scale[None, :]) ** 2, axis=1)
+    lap_V = -2.0 * V * sech2 * W_scaled_sq_sum[None, :]
+    return V, lap_V
+
+
 # ===== 2D functions =====
 
 
